@@ -91,7 +91,8 @@ gui.title('Parameters');
 // ── State ──
 
 let activeSim: Simulation | null = null;
-const clock = new THREE.Clock();
+const timer = new THREE.Timer();
+timer.connect(document);
 let isTransitioning = false;
 
 // ── Generative Favicon ──
@@ -241,8 +242,9 @@ document.addEventListener('keydown', (e) => {
 
 function animate() {
   requestAnimationFrame(animate);
-  const delta = clock.getDelta();
-  const elapsed = clock.getElapsedTime();
+  timer.update();
+  const delta = timer.getDelta();
+  const elapsed = timer.getElapsed();
   controls.update();
   if (activeSim) {
     activeSim.update(elapsed, delta);

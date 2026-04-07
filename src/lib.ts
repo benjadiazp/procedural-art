@@ -103,7 +103,8 @@ export function mount(container: HTMLElement, options: MountOptions = {}): Mount
 
   // State
   let activeSim: Simulation | null = null;
-  const clock = new THREE.Clock();
+  const timer = new THREE.Timer();
+  timer.connect(document);
   let disposed = false;
   let animId: number | null = null;
 
@@ -161,8 +162,9 @@ export function mount(container: HTMLElement, options: MountOptions = {}): Mount
   function animate() {
     if (disposed) return;
     animId = requestAnimationFrame(animate);
-    const delta = clock.getDelta();
-    const elapsed = clock.getElapsedTime();
+    timer.update();
+    const delta = timer.getDelta();
+    const elapsed = timer.getElapsed();
     controls.update();
     if (activeSim) activeSim.update(elapsed, delta);
     if (activeSim?.render) {
@@ -186,6 +188,7 @@ export function mount(container: HTMLElement, options: MountOptions = {}): Mount
       ro.disconnect();
       canvas.removeEventListener('pointerdown', onPointerDown);
       activeSim?.dispose();
+      timer.dispose();
       gui.destroy();
       controls.dispose();
       renderer.dispose();
