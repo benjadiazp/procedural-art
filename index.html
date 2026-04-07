@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Procedural Art</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <button id="menu-toggle" aria-label="Toggle menu">&#9776;</button>
+    <div id="panel">
+      <div id="panel-header">
+        <div>
+          <h1>Procedural Art</h1>
+          <small class="subtitle">GPU Simulations</small>
+        </div>
+        <button id="panel-close" aria-label="Close panel">&times;</button>
+      </div>
+      <ul id="simulation-list"></ul>
+      <div id="gui-container"></div>
+    </div>
+    <div id="transition-overlay"></div>
+    <div id="hints"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
