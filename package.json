@@ -2,6 +2,7 @@
   "name": "@benjadiazp/procedural-art",
   "version": "0.1.0",
   "description": "GPU-accelerated procedural art simulations built with Three.js",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/procedural-art.js",
   "module": "./dist/procedural-art.js",
