@@ -22,7 +22,8 @@
     "build:lib": "BUILD_LIB=true vite build && tsc -p tsconfig.lib.json",
     "preview": "vite preview",
     "test": "bunx playwright test --reporter=list",
-    "test:headed": "bunx playwright test --headed"
+    "test:headed": "bunx playwright test --headed",
+    "release": "bun run build:lib && git push && git tag v$(node -p \"require('./package.json').version\") && git push --tags"
   },
   "peerDependencies": {
     "three": ">=0.160.0",
