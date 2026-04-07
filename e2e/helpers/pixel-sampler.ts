@@ -32,15 +32,3 @@ export async function samplePixels(page: Page): Promise<number[][]> {
     return results;
   });
 }
-
-/**
- * Returns a snapshot string of the canvas content.
- * Uses toDataURL which captures the full canvas state.
- * Requires preserveDrawingBuffer: true on the renderer.
- */
-export async function canvasSnapshot(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const canvas = document.getElementById('canvas') as HTMLCanvasElement;
-    return canvas.toDataURL('image/png');
-  });
-}
