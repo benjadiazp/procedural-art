@@ -13,7 +13,7 @@ GPU-accelerated procedural art simulations built with Three.js, TypeScript, and 
 ## Usage as npm package
 
 ```bash
-npm install @benjadiazp/procedural-art three lil-gui postprocessing
+npm install @benjadiazp/procedural-art
 ```
 
 Mount a simulation into any container element:
