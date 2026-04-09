@@ -10,7 +10,12 @@ export function addPresetControl<P extends { preset: string }>(
   applyParams: () => void,
   label: (key: string) => string,
 ): void {
-  gui.add(params, 'preset', Object.keys(presets)).name(label('Preset')).onChange((name: string) => {
+  // Map translated display names to internal English keys for the dropdown
+  const options: Record<string, string> = {};
+  for (const key of Object.keys(presets)) {
+    options[label(key)] = key;
+  }
+  gui.add(params, 'preset', options).name(label('Preset')).onChange((name: string) => {
     Object.assign(params, presets[name]);
     applyParams();
     gui.controllersRecursive().forEach(c => c.updateDisplay());

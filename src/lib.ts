@@ -6,6 +6,8 @@ import { simulations } from './simulations';
 import { configure2DControls, createClickHandler } from './shared/context';
 
 export type { Simulation, SimulationContext, SimulationClickEvent };
+export { i18nKeys } from './i18n';
+export type { LabelKey } from './i18n';
 
 export interface MountOptions {
   /** Name of the simulation to load (case-insensitive). Defaults to the first registered simulation. */
