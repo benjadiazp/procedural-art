@@ -2,23 +2,37 @@ name: Publish
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
 
-permissions:
-  id-token: write
-  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v4
         with:
-          node-version: '24'
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
           registry-url: 'https://registry.npmjs.org'
-      - run: bun install
-      - run: bun run build:lib
-      - run: npm publish --access public
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun test
+
+      - run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

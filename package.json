@@ -1,6 +1,6 @@
 {
   "name": "@benjadiazp/procedural-art",
-  "version": "0.1.4",
+  "version": "0.1.4-semantic-release",
   "description": "GPU-accelerated procedural art simulations built with Three.js",
   "license": "MIT",
   "type": "module",
@@ -16,6 +16,10 @@
   "files": [
     "dist"
   ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -32,10 +36,13 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/git": "^10.0.1",
     "@types/three": "^0.183.1",
     "lil-gui": "^0.21.0",
     "postprocessing": "^6.39.0",
     "puppeteer": "^24.40.0",
+    "semantic-release": "^25.0.3",
     "three": "^0.183.2",
     "typescript": "~5.9.3",
     "vite": "^8.0.1"
