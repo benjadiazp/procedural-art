@@ -1,3 +1,10 @@
+## [0.1.6](https://github.com/benjadiazp/procedural-art/compare/v0.1.5...v0.1.6) (2026-04-09)
+
+
+### Bug Fixes
+
+* git small fix ([14988de](https://github.com/benjadiazp/procedural-art/commit/14988de63f4d57260c6c39b447986c09ba838f0b))
+
 ## [0.1.5](https://github.com/benjadiazp/procedural-art/compare/v0.1.4...v0.1.5) (2026-04-09)
 
 

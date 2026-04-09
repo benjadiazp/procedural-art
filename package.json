@@ -1,6 +1,6 @@
 {
   "name": "@benjadiazp/procedural-art",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "GPU-accelerated procedural art simulations built with Three.js",
   "license": "MIT",
   "repository": {
