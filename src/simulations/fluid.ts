@@ -276,6 +276,7 @@ const PRESETS: Record<string, PresetValues> = {
 
 export class FluidSimulation implements Simulation {
   name = 'Fluid';
+  is2D = true;
 
   /* compute infrastructure */
   private computeScene!: THREE.Scene;
