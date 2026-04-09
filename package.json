@@ -26,8 +26,7 @@
     "build:lib": "BUILD_LIB=true vite build && tsc -p tsconfig.lib.json",
     "preview": "vite preview",
     "test": "bunx playwright test --reporter=list",
-    "test:headed": "bunx playwright test --headed",
-    "release": "bun run build:lib && git push && git tag v$(node -p \"require('./package.json').version\") && git push --tags"
+    "test:headed": "bunx playwright test --headed"
   },
   "peerDependencies": {
     "three": ">=0.160.0",
@@ -37,6 +36,7 @@
   "devDependencies": {
     "@playwright/test": "^1.59.1",
     "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/exec": "^7.1.0",
     "@semantic-release/git": "^10.0.1",
     "@types/three": "^0.183.1",
     "lil-gui": "^0.21.0",
