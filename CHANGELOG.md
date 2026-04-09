@@ -1,3 +1,10 @@
+## [0.1.7](https://github.com/benjadiazp/procedural-art/compare/v0.1.6...v0.1.7) (2026-04-09)
+
+
+### Bug Fixes
+
+* updated visualizations ([437538b](https://github.com/benjadiazp/procedural-art/commit/437538b47b092778756a054a7dc5a21858c03fa8))
+
 ## [0.1.6](https://github.com/benjadiazp/procedural-art/compare/v0.1.5...v0.1.6) (2026-04-09)
 
 
