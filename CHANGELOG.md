@@ -1,3 +1,10 @@
+## [0.1.8](https://github.com/benjadiazp/procedural-art/compare/v0.1.7...v0.1.8) (2026-04-09)
+
+
+### Bug Fixes
+
+* localizable strings ([7a95a33](https://github.com/benjadiazp/procedural-art/commit/7a95a33477a2790ec4ea1dc964e5223c8ae164c5))
+
 ## [0.1.7](https://github.com/benjadiazp/procedural-art/compare/v0.1.6...v0.1.7) (2026-04-09)
 
 
