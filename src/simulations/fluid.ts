@@ -1,171 +1,22 @@
 import * as THREE from 'three';
-import {
-  EffectComposer, EffectPass, RenderPass,
-  BloomEffect, ChromaticAberrationEffect, VignetteEffect, NoiseEffect,
-  BlendFunction,
-} from 'postprocessing';
 import type { Simulation, SimulationContext } from '../simulation';
+import { addPresetControl } from '../shared/preset';
+import { createPostProcessing, type PostProcessingResult } from '../shared/post-processing';
+import computeVert from './shaders/fluid/compute.vert.glsl?raw';
+import splatFrag from './shaders/fluid/splat.frag.glsl?raw';
+import advectFrag from './shaders/fluid/advect.frag.glsl?raw';
+import divergenceFrag from './shaders/fluid/divergence.frag.glsl?raw';
+import pressureFrag from './shaders/fluid/pressure.frag.glsl?raw';
+import gradientSubFrag from './shaders/fluid/gradient-sub.frag.glsl?raw';
+import curlFrag from './shaders/fluid/curl.frag.glsl?raw';
+import vorticityFrag from './shaders/fluid/vorticity.frag.glsl?raw';
+import clearFrag from './shaders/fluid/clear.frag.glsl?raw';
+import displayVert from './shaders/fluid/display.vert.glsl?raw';
+import displayFrag from './shaders/fluid/display.frag.glsl?raw';
 
 const SIM_SIZE = 512;
 const PLANE_SIZE = 20;
-
-// ────────────────────────────── GLSL ──────────────────────────────
-
-const computeVert = /* glsl */ `
-varying vec2 vUv;
-void main() {
-  vUv = position.xy * 0.5 + 0.5;
-  gl_Position = vec4(position.xy, 0.0, 1.0);
-}
-`;
-
-const splatFrag = /* glsl */ `
-uniform sampler2D uTarget;
-uniform vec2 uPoint;
-uniform vec3 uSplatColor;
-uniform float uRadius;
-varying vec2 vUv;
-
-void main() {
-  vec2 d = vUv - uPoint;
-  vec3 base = texture2D(uTarget, vUv).xyz;
-  vec3 splat = uSplatColor * exp(-dot(d, d) / uRadius);
-  gl_FragColor = vec4(base + splat, 1.0);
-}
-`;
-
-const advectFrag = /* glsl */ `
-uniform sampler2D uVelocity;
-uniform sampler2D uSource;
-uniform vec2 uTexelSize;
-uniform float uDt;
-uniform float uDissipation;
-varying vec2 vUv;
-
-void main() {
-  vec2 vel = texture2D(uVelocity, vUv).xy;
-  vec2 coord = vUv - uDt * vel * uTexelSize;
-  gl_FragColor = vec4(uDissipation * texture2D(uSource, coord).xyz, 1.0);
-}
-`;
-
-const divergenceFrag = /* glsl */ `
-uniform sampler2D uVelocity;
-uniform vec2 uTexelSize;
-varying vec2 vUv;
-
-void main() {
-  float R = texture2D(uVelocity, vUv + vec2(uTexelSize.x, 0.0)).x;
-  float L = texture2D(uVelocity, vUv - vec2(uTexelSize.x, 0.0)).x;
-  float T = texture2D(uVelocity, vUv + vec2(0.0, uTexelSize.y)).y;
-  float B = texture2D(uVelocity, vUv - vec2(0.0, uTexelSize.y)).y;
-  gl_FragColor = vec4(0.5 * (R - L + T - B), 0.0, 0.0, 1.0);
-}
-`;
-
-const pressureFrag = /* glsl */ `
-uniform sampler2D uPressure;
-uniform sampler2D uDivergence;
-uniform vec2 uTexelSize;
-varying vec2 vUv;
-
-void main() {
-  float R = texture2D(uPressure, vUv + vec2(uTexelSize.x, 0.0)).x;
-  float L = texture2D(uPressure, vUv - vec2(uTexelSize.x, 0.0)).x;
-  float T = texture2D(uPressure, vUv + vec2(0.0, uTexelSize.y)).x;
-  float B = texture2D(uPressure, vUv - vec2(0.0, uTexelSize.y)).x;
-  float div = texture2D(uDivergence, vUv).x;
-  gl_FragColor = vec4((R + L + T + B - div) * 0.25, 0.0, 0.0, 1.0);
-}
-`;
-
-const gradientSubFrag = /* glsl */ `
-uniform sampler2D uPressure;
-uniform sampler2D uVelocity;
-uniform vec2 uTexelSize;
-varying vec2 vUv;
-
-void main() {
-  float R = texture2D(uPressure, vUv + vec2(uTexelSize.x, 0.0)).x;
-  float L = texture2D(uPressure, vUv - vec2(uTexelSize.x, 0.0)).x;
-  float T = texture2D(uPressure, vUv + vec2(0.0, uTexelSize.y)).x;
-  float B = texture2D(uPressure, vUv - vec2(0.0, uTexelSize.y)).x;
-  vec2 vel = texture2D(uVelocity, vUv).xy;
-  vel -= vec2(R - L, T - B) * 0.5;
-  gl_FragColor = vec4(vel, 0.0, 1.0);
-}
-`;
-
-const curlFrag = /* glsl */ `
-uniform sampler2D uVelocity;
-uniform vec2 uTexelSize;
-varying vec2 vUv;
-
-void main() {
-  float R = texture2D(uVelocity, vUv + vec2(uTexelSize.x, 0.0)).y;
-  float L = texture2D(uVelocity, vUv - vec2(uTexelSize.x, 0.0)).y;
-  float T = texture2D(uVelocity, vUv + vec2(0.0, uTexelSize.y)).x;
-  float B = texture2D(uVelocity, vUv - vec2(0.0, uTexelSize.y)).x;
-  gl_FragColor = vec4((R - L) - (T - B), 0.0, 0.0, 1.0);
-}
-`;
-
-const vorticityFrag = /* glsl */ `
-uniform sampler2D uVelocity;
-uniform sampler2D uCurl;
-uniform vec2 uTexelSize;
-uniform float uStrength;
-uniform float uDt;
-varying vec2 vUv;
-
-void main() {
-  float cR = abs(texture2D(uCurl, vUv + vec2(uTexelSize.x, 0.0)).x);
-  float cL = abs(texture2D(uCurl, vUv - vec2(uTexelSize.x, 0.0)).x);
-  float cT = abs(texture2D(uCurl, vUv + vec2(0.0, uTexelSize.y)).x);
-  float cB = abs(texture2D(uCurl, vUv - vec2(0.0, uTexelSize.y)).x);
-  float c = texture2D(uCurl, vUv).x;
-
-  vec2 N = vec2(cR - cL, cT - cB);
-  N /= length(N) + 1e-5;
-  vec2 force = uStrength * c * vec2(N.y, -N.x);
-
-  vec2 vel = texture2D(uVelocity, vUv).xy + force * uDt;
-  gl_FragColor = vec4(vel, 0.0, 1.0);
-}
-`;
-
-const clearFrag = /* glsl */ `
-uniform sampler2D uTexture;
-uniform float uDissipation;
-varying vec2 vUv;
-
-void main() {
-  gl_FragColor = uDissipation * texture2D(uTexture, vUv);
-}
-`;
-
-const displayVert = /* glsl */ `
-varying vec2 vUv;
-void main() {
-  vUv = uv;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-}
-`;
-
-const displayFrag = /* glsl */ `
-uniform sampler2D tDye;
-uniform float uBrightness;
-uniform vec3 uBackground;
-varying vec2 vUv;
-
-void main() {
-  vec3 dye = texture2D(tDye, vUv).rgb;
-  vec3 color = dye * uBrightness;
-  float intensity = max(color.r, max(color.g, color.b));
-  color = mix(uBackground, color, smoothstep(0.0, 0.05, intensity));
-  gl_FragColor = vec4(color, 1.0);
-}
-`;
+const PRESSURE_CLEAR_DISSIPATION = 0.8;
 
 // ────────────────────────────── Double FBO ──────────────────────────────
 
@@ -306,11 +157,7 @@ export class FluidSimulation implements Simulation {
   private displayGeo!: THREE.PlaneGeometry;
 
   /* post-processing */
-  private composer!: EffectComposer;
-  private bloomEffect!: BloomEffect;
-  private chromaticAberration!: ChromaticAberrationEffect;
-  private vignetteEffect!: VignetteEffect;
-  private noiseEffect!: NoiseEffect;
+  private pp!: PostProcessingResult;
 
   private ctx!: SimulationContext;
   private canvas!: HTMLCanvasElement;
@@ -431,7 +278,7 @@ export class FluidSimulation implements Simulation {
 
     // 4. Clear pressure (partial dissipation for better convergence)
     this.clearMat.uniforms.uTexture.value = this.pressure.read.texture;
-    this.clearMat.uniforms.uDissipation.value = 0.8;
+    this.clearMat.uniforms.uDissipation.value = PRESSURE_CLEAR_DISSIPATION;
     this.renderPass(renderer, this.clearMat, this.pressure.write);
     this.pressure.swap();
 
@@ -462,11 +309,11 @@ export class FluidSimulation implements Simulation {
   }
 
   render() {
-    this.composer.render();
+    this.pp.composer.render();
   }
 
   onResize(w: number, h: number) {
-    this.composer.setSize(w, h);
+    this.pp.composer.setSize(w, h);
   }
 
   resetCamera(ctx: SimulationContext) {
@@ -508,7 +355,7 @@ export class FluidSimulation implements Simulation {
     this.clearMat.dispose();
     this.displayMat.dispose();
     this.displayGeo.dispose();
-    this.composer.dispose();
+    this.pp.composer.dispose();
 
     this.canvas.removeEventListener('pointerdown', this.boundPointerDown);
     this.canvas.removeEventListener('pointermove', this.boundPointerMove);
@@ -602,7 +449,7 @@ export class FluidSimulation implements Simulation {
   private initMaterials() {
     const texelSize = new THREE.Vector2(1 / SIM_SIZE, 1 / SIM_SIZE);
 
-    const mat = (frag: string, uniforms: Record<string, { value: any }>) =>
+    const mat = (frag: string, uniforms: Record<string, { value: unknown }>) =>
       new THREE.ShaderMaterial({ vertexShader: computeVert, fragmentShader: frag, uniforms });
 
     this.splatMat = mat(splatFrag, {
@@ -672,39 +519,14 @@ export class FluidSimulation implements Simulation {
   }
 
   private initPostProcessing(ctx: SimulationContext) {
-    this.composer = new EffectComposer(ctx.renderer, {
-      frameBufferType: THREE.HalfFloatType,
+    this.pp = createPostProcessing(ctx.renderer, ctx.scene, ctx.camera, {
+      bloomStrength: this.params.bloomStrength,
+      bloomThreshold: this.params.bloomThreshold,
+      bloomSmoothing: this.params.bloomSmoothing,
+      chromaticAberration: this.params.chromaticAberration,
+      vignetteDarkness: this.params.vignetteDarkness,
+      noiseIntensity: this.params.noiseIntensity,
     });
-    this.composer.addPass(new RenderPass(ctx.scene, ctx.camera));
-
-    this.bloomEffect = new BloomEffect({
-      intensity: this.params.bloomStrength,
-      luminanceThreshold: this.params.bloomThreshold,
-      luminanceSmoothing: this.params.bloomSmoothing,
-      mipmapBlur: true,
-    });
-
-    this.chromaticAberration = new ChromaticAberrationEffect({
-      offset: new THREE.Vector2(this.params.chromaticAberration, this.params.chromaticAberration),
-      radialModulation: true,
-      modulationOffset: 0.15,
-    });
-
-    this.vignetteEffect = new VignetteEffect({
-      darkness: this.params.vignetteDarkness,
-      offset: 0.3,
-    });
-
-    this.noiseEffect = new NoiseEffect({ blendFunction: BlendFunction.OVERLAY });
-    this.noiseEffect.blendMode.opacity.value = this.params.noiseIntensity;
-
-    this.composer.addPass(new EffectPass(
-      ctx.camera,
-      this.bloomEffect,
-      this.chromaticAberration,
-      this.vignetteEffect,
-      this.noiseEffect,
-    ));
   }
 
   /* ─── pointer handling ─── */
@@ -757,58 +579,58 @@ export class FluidSimulation implements Simulation {
     this.displayMat.uniforms.uBrightness.value = p.brightness;
     (this.displayMat.uniforms.uBackground.value as THREE.Color).set(p.backgroundColor);
 
-    this.bloomEffect.intensity = p.bloomStrength;
-    this.bloomEffect.luminanceMaterial.threshold = p.bloomThreshold;
-    this.bloomEffect.luminanceMaterial.smoothing = p.bloomSmoothing;
-    this.chromaticAberration.offset.set(p.chromaticAberration, p.chromaticAberration);
-    this.vignetteEffect.darkness = p.vignetteDarkness;
-    this.noiseEffect.blendMode.opacity.value = p.noiseIntensity;
+    this.pp.applyParams({
+      bloomStrength: p.bloomStrength,
+      bloomThreshold: p.bloomThreshold,
+      bloomSmoothing: p.bloomSmoothing,
+      chromaticAberration: p.chromaticAberration,
+      vignetteDarkness: p.vignetteDarkness,
+      noiseIntensity: p.noiseIntensity,
+    });
   }
 
   private setupGUI(ctx: SimulationContext) {
-    ctx.gui.add(this.params, 'preset', Object.keys(PRESETS)).name('Preset').onChange((name: string) => {
-      Object.assign(this.params, PRESETS[name]);
-      this.applyParams();
-      ctx.gui.controllersRecursive().forEach(c => c.updateDisplay());
-    });
+    const { l } = ctx;
 
-    const phys = ctx.gui.addFolder('Physics');
-    phys.add(this.params, 'velocityDissipation', 0.9, 1.0, 0.001).name('Vel. Dissipation');
-    phys.add(this.params, 'dyeDissipation', 0.9, 1.0, 0.001).name('Dye Dissipation');
-    phys.add(this.params, 'curlStrength', 0, 80, 1).name('Vorticity');
-    phys.add(this.params, 'pressureIterations', 5, 60, 1).name('Pressure Iters');
+    addPresetControl(ctx.gui, this.params, PRESETS, () => this.applyParams(), l);
 
-    const brush = ctx.gui.addFolder('Brush');
-    brush.add(this.params, 'splatRadius', 0.001, 0.02, 0.0005).name('Radius');
-    brush.add(this.params, 'splatForce', 1000, 15000, 100).name('Force');
-    brush.add(this.params, 'colorSaturation', 0, 1, 0.05).name('Saturation');
+    const phys = ctx.gui.addFolder(l('Physics'));
+    phys.add(this.params, 'velocityDissipation', 0.9, 1.0, 0.001).name(l('Vel. Dissipation'));
+    phys.add(this.params, 'dyeDissipation', 0.9, 1.0, 0.001).name(l('Dye Dissipation'));
+    phys.add(this.params, 'curlStrength', 0, 80, 1).name(l('Vorticity'));
+    phys.add(this.params, 'pressureIterations', 5, 60, 1).name(l('Pressure Iters'));
 
-    const look = ctx.gui.addFolder('Appearance');
-    look.addColor(this.params, 'backgroundColor').name('Background').onChange((v: string) => {
+    const brush = ctx.gui.addFolder(l('Brush'));
+    brush.add(this.params, 'splatRadius', 0.001, 0.02, 0.0005).name(l('Radius'));
+    brush.add(this.params, 'splatForce', 1000, 15000, 100).name(l('Force'));
+    brush.add(this.params, 'colorSaturation', 0, 1, 0.05).name(l('Saturation'));
+
+    const look = ctx.gui.addFolder(l('Appearance'));
+    look.addColor(this.params, 'backgroundColor').name(l('Background')).onChange((v: string) => {
       (this.displayMat.uniforms.uBackground.value as THREE.Color).set(v);
     });
-    look.add(this.params, 'brightness', 0.1, 3.0, 0.05).name('Brightness').onChange((v: number) => {
+    look.add(this.params, 'brightness', 0.1, 3.0, 0.05).name(l('Brightness')).onChange((v: number) => {
       this.displayMat.uniforms.uBrightness.value = v;
     });
 
-    const pp = ctx.gui.addFolder('Post Processing');
-    pp.add(this.params, 'bloomStrength', 0, 2, 0.05).name('Bloom Strength').onChange((v: number) => {
-      this.bloomEffect.intensity = v;
+    const pp = ctx.gui.addFolder(l('Post Processing'));
+    pp.add(this.params, 'bloomStrength', 0, 2, 0.05).name(l('Bloom Strength')).onChange((v: number) => {
+      this.pp.bloomEffect.intensity = v;
     });
-    pp.add(this.params, 'bloomSmoothing', 0, 1, 0.05).name('Bloom Smoothing').onChange((v: number) => {
-      this.bloomEffect.luminanceMaterial.smoothing = v;
+    pp.add(this.params, 'bloomSmoothing', 0, 1, 0.05).name(l('Bloom Smoothing')).onChange((v: number) => {
+      this.pp.bloomEffect.luminanceMaterial.smoothing = v;
     });
-    pp.add(this.params, 'bloomThreshold', 0, 1, 0.05).name('Bloom Threshold').onChange((v: number) => {
-      this.bloomEffect.luminanceMaterial.threshold = v;
+    pp.add(this.params, 'bloomThreshold', 0, 1, 0.05).name(l('Bloom Threshold')).onChange((v: number) => {
+      this.pp.bloomEffect.luminanceMaterial.threshold = v;
     });
-    pp.add(this.params, 'chromaticAberration', 0, 0.5, 0.01).name('Chromatic Aberration').onChange((v: number) => {
-      this.chromaticAberration.offset.set(v, v);
+    pp.add(this.params, 'chromaticAberration', 0, 0.5, 0.01).name(l('Chromatic Aberration')).onChange((v: number) => {
+      this.pp.chromaticAberration.offset.set(v, v);
     });
-    pp.add(this.params, 'vignetteDarkness', 0, 1, 0.05).name('Vignette').onChange((v: number) => {
-      this.vignetteEffect.darkness = v;
+    pp.add(this.params, 'vignetteDarkness', 0, 1, 0.05).name(l('Vignette')).onChange((v: number) => {
+      this.pp.vignetteEffect.darkness = v;
     });
-    pp.add(this.params, 'noiseIntensity', 0, 0.15, 0.005).name('Film Grain').onChange((v: number) => {
-      this.noiseEffect.blendMode.opacity.value = v;
+    pp.add(this.params, 'noiseIntensity', 0, 0.15, 0.005).name(l('Film Grain')).onChange((v: number) => {
+      this.pp.noiseEffect.blendMode.opacity.value = v;
     });
   }
 

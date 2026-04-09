@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
 import type { Simulation, SimulationContext, SimulationClickEvent } from './simulation';
 import { simulations } from './simulations';
+import { configure2DControls, createClickHandler } from './shared/context';
 
 export type { Simulation, SimulationContext, SimulationClickEvent };
 
@@ -13,6 +14,8 @@ export interface MountOptions {
   showControls?: boolean;
   /** WebGL antialias. Default: true */
   antialias?: boolean;
+  /** Optional label translations. Keys are the English label text; values are the translated text. */
+  labels?: Record<string, string>;
 }
 
 export interface MountResult {
@@ -72,7 +75,8 @@ function injectStyles() {
 }
 
 export function mount(container: HTMLElement, options: MountOptions = {}): MountResult {
-  const { simulation: simName, showControls = false, antialias = true } = options;
+  const { simulation: simName, showControls = false, antialias = true, labels } = options;
+  const l = (key: string) => labels?.[key] ?? key;
 
   injectStyles();
   container.classList.add('pa-embed-root');
@@ -112,7 +116,7 @@ export function mount(container: HTMLElement, options: MountOptions = {}): Mount
     if (activeSim) activeSim.dispose();
     gui.destroy();
     gui = new GUI({ container: guiWrap });
-    gui.title('Parameters');
+    gui.title(l('Parameters'));
 
     scene = new THREE.Scene();
     camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 1000);
@@ -121,29 +125,16 @@ export function mount(container: HTMLElement, options: MountOptions = {}): Mount
     controls.enableDamping = true;
 
     if (sim.is2D) {
-      controls.enableRotate = false;
-      controls.screenSpacePanning = true;
-      controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
-      controls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_PAN };
+      configure2DControls(controls);
     }
 
-    const ctx: SimulationContext = { scene, camera, renderer, controls, gui };
+    const ctx: SimulationContext = { scene, camera, renderer, controls, gui, l };
     sim.setup(ctx);
     activeSim = sim;
   }
 
   // Click handling
-  const raycaster = new THREE.Raycaster();
-  function onPointerDown(e: PointerEvent) {
-    if (!activeSim?.onClick) return;
-    const rect = canvas.getBoundingClientRect();
-    const ndc = new THREE.Vector2(
-      ((e.clientX - rect.left) / rect.width) * 2 - 1,
-      -((e.clientY - rect.top) / rect.height) * 2 + 1,
-    );
-    raycaster.setFromCamera(ndc, camera);
-    activeSim.onClick({ ndc, pointer: e, raycaster });
-  }
+  const onPointerDown = createClickHandler(canvas, () => camera, () => activeSim);
   canvas.addEventListener('pointerdown', onPointerDown);
 
   // Resize via ResizeObserver (no window listener needed)

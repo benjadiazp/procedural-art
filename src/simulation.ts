@@ -40,6 +40,8 @@ export interface SimulationContext {
   renderer: THREE.WebGLRenderer;
   controls?: OrbitControls;
   gui: GUI;
+  /** Optional label lookup — returns the translated text for a given English key, or the key itself if no translation is provided. */
+  l: (key: string) => string;
 }
 
 export interface SimulationClickEvent {

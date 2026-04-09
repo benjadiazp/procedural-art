@@ -1,111 +1,15 @@
 import * as THREE from 'three';
 import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
-import {
-  EffectComposer, EffectPass, RenderPass,
-  BloomEffect, ChromaticAberrationEffect, VignetteEffect, NoiseEffect,
-  BlendFunction,
-} from 'postprocessing';
 import type { Simulation, SimulationContext, SimulationClickEvent } from '../simulation';
+import type { GPUVariable } from '../shared/types';
+import { addPresetControl } from '../shared/preset';
+import { createPostProcessing, type PostProcessingResult } from '../shared/post-processing';
+import computeShader from './shaders/reaction-diffusion/compute.frag.glsl?raw';
+import displayVert from './shaders/reaction-diffusion/display.vert.glsl?raw';
+import displayFrag from './shaders/reaction-diffusion/display.frag.glsl?raw';
 
 const SIM_SIZE = 512;
 const PLANE_SIZE = 20;
-
-// ────────────────────────────── GLSL ──────────────────────────────
-
-const computeShader = /* glsl */ `
-uniform float uFeedRate;
-uniform float uKillRate;
-uniform float uDiffusionU;
-uniform float uDiffusionV;
-uniform float uTimestep;
-uniform vec4 uBrush; // xy = position (0-1), z = radius, w = active
-
-void main() {
-  vec2 uv = gl_FragCoord.xy / resolution.xy;
-  vec2 tx = 1.0 / resolution.xy;
-
-  vec4 c = texture2D(textureChemicals, uv);
-  float U = c.r;
-  float V = c.g;
-
-  // 9-point weighted Laplacian (wrap handled by RepeatWrapping)
-  float lapU = -U, lapV = -V;
-  vec4 s;
-
-  // Cardinals (weight 0.2)
-  s = texture2D(textureChemicals, uv + vec2( tx.x, 0.0)); lapU += s.r * 0.2; lapV += s.g * 0.2;
-  s = texture2D(textureChemicals, uv + vec2(-tx.x, 0.0)); lapU += s.r * 0.2; lapV += s.g * 0.2;
-  s = texture2D(textureChemicals, uv + vec2(0.0,  tx.y)); lapU += s.r * 0.2; lapV += s.g * 0.2;
-  s = texture2D(textureChemicals, uv + vec2(0.0, -tx.y)); lapU += s.r * 0.2; lapV += s.g * 0.2;
-
-  // Diagonals (weight 0.05)
-  s = texture2D(textureChemicals, uv + vec2( tx.x,  tx.y)); lapU += s.r * 0.05; lapV += s.g * 0.05;
-  s = texture2D(textureChemicals, uv + vec2(-tx.x,  tx.y)); lapU += s.r * 0.05; lapV += s.g * 0.05;
-  s = texture2D(textureChemicals, uv + vec2( tx.x, -tx.y)); lapU += s.r * 0.05; lapV += s.g * 0.05;
-  s = texture2D(textureChemicals, uv + vec2(-tx.x, -tx.y)); lapU += s.r * 0.05; lapV += s.g * 0.05;
-
-  // Gray-Scott reaction-diffusion
-  float uvv = U * V * V;
-  float newU = U + (uDiffusionU * lapU - uvv + uFeedRate * (1.0 - U)) * uTimestep;
-  float newV = V + (uDiffusionV * lapV + uvv - (uFeedRate + uKillRate) * V) * uTimestep;
-
-  // Brush seeding
-  if (uBrush.w > 0.5) {
-    vec2 d = abs(uv - uBrush.xy);
-    d = min(d, 1.0 - d); // wrap-aware distance
-    float dist = length(d);
-    if (dist < uBrush.z) {
-      float t = smoothstep(uBrush.z, uBrush.z * 0.2, dist);
-      newV = mix(newV, 1.0, t);
-      newU = mix(newU, 0.0, t * 0.5);
-    }
-  }
-
-  gl_FragColor = vec4(clamp(newU, 0.0, 1.0), clamp(newV, 0.0, 1.0), 0.0, 1.0);
-}
-`;
-
-const displayVert = /* glsl */ `
-varying vec2 vUv;
-void main() {
-  vUv = uv;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-}
-`;
-
-const displayFrag = /* glsl */ `
-uniform sampler2D tChemicals;
-uniform vec3 uColor1;
-uniform vec3 uColor2;
-uniform vec3 uColor3;
-uniform vec3 uColor4;
-uniform float uBrightness;
-
-varying vec2 vUv;
-
-void main() {
-  vec4 chem = texture2D(tChemicals, vUv);
-  float v = chem.g;
-  float u = chem.r;
-
-  // Multi-stop gradient driven by V concentration
-  vec3 color;
-  float t1 = 0.08, t2 = 0.25;
-  if (v < t1) {
-    color = mix(uColor1, uColor2, v / t1);
-  } else if (v < t2) {
-    color = mix(uColor2, uColor3, (v - t1) / (t2 - t1));
-  } else {
-    color = mix(uColor3, uColor4, clamp((v - t2) / (1.0 - t2), 0.0, 1.0));
-  }
-
-  // Subtle depth shading from U chemical
-  color *= 0.82 + 0.18 * u;
-  color *= uBrightness;
-
-  gl_FragColor = vec4(color, 1.0);
-}
-`;
 
 // ────────────────────────────── Presets ──────────────────────────────
 
@@ -194,17 +98,13 @@ export class ReactionDiffusionSimulation implements Simulation {
   is2D = true;
 
   private gpuCompute!: GPUComputationRenderer;
-  private chemVar: any;
+  private chemVar!: GPUVariable;
 
   private displayMesh!: THREE.Mesh;
   private displayMat!: THREE.ShaderMaterial;
   private displayGeo!: THREE.PlaneGeometry;
 
-  private composer!: EffectComposer;
-  private bloomEffect!: BloomEffect;
-  private chromaticAberration!: ChromaticAberrationEffect;
-  private vignetteEffect!: VignetteEffect;
-  private noiseEffect!: NoiseEffect;
+  private pp!: PostProcessingResult;
 
   private ctx!: SimulationContext;
 
@@ -278,11 +178,11 @@ export class ReactionDiffusionSimulation implements Simulation {
   }
 
   render() {
-    this.composer.render();
+    this.pp.composer.render();
   }
 
   onResize(w: number, h: number) {
-    this.composer.setSize(w, h);
+    this.pp.composer.setSize(w, h);
   }
 
   resetCamera(ctx: SimulationContext) {
@@ -299,7 +199,7 @@ export class ReactionDiffusionSimulation implements Simulation {
     this.gpuCompute.dispose();
     this.displayMat.dispose();
     this.displayGeo.dispose();
-    this.composer.dispose();
+    this.pp.composer.dispose();
   }
 
   /* ─── init helpers ─── */
@@ -377,42 +277,14 @@ export class ReactionDiffusionSimulation implements Simulation {
   }
 
   private initPostProcessing(ctx: SimulationContext) {
-    this.composer = new EffectComposer(ctx.renderer, {
-      frameBufferType: THREE.HalfFloatType,
+    this.pp = createPostProcessing(ctx.renderer, ctx.scene, ctx.camera, {
+      bloomStrength: this.params.bloomStrength,
+      bloomThreshold: this.params.bloomThreshold,
+      bloomSmoothing: this.params.bloomRadius,
+      chromaticAberration: this.params.chromaticAberration,
+      vignetteDarkness: this.params.vignetteDarkness,
+      noiseIntensity: this.params.noiseIntensity,
     });
-
-    this.composer.addPass(new RenderPass(ctx.scene, ctx.camera));
-
-    this.bloomEffect = new BloomEffect({
-      intensity: this.params.bloomStrength,
-      luminanceThreshold: this.params.bloomThreshold,
-      luminanceSmoothing: this.params.bloomRadius,
-      mipmapBlur: true,
-    });
-
-    this.chromaticAberration = new ChromaticAberrationEffect({
-      offset: new THREE.Vector2(this.params.chromaticAberration, this.params.chromaticAberration),
-      radialModulation: true,
-      modulationOffset: 0.15,
-    });
-
-    this.vignetteEffect = new VignetteEffect({
-      darkness: this.params.vignetteDarkness,
-      offset: 0.3,
-    });
-
-    this.noiseEffect = new NoiseEffect({
-      blendFunction: BlendFunction.OVERLAY,
-    });
-    this.noiseEffect.blendMode.opacity.value = this.params.noiseIntensity;
-
-    this.composer.addPass(new EffectPass(
-      ctx.camera,
-      this.bloomEffect,
-      this.chromaticAberration,
-      this.vignetteEffect,
-      this.noiseEffect,
-    ));
   }
 
   /* ─── GUI ─── */
@@ -434,77 +306,77 @@ export class ReactionDiffusionSimulation implements Simulation {
     (mu.uColor4.value as THREE.Color).set(p.color4);
     mu.uBrightness.value = p.brightness;
 
-    this.bloomEffect.intensity = p.bloomStrength;
-    this.bloomEffect.luminanceMaterial.threshold = p.bloomThreshold;
-    this.bloomEffect.luminanceMaterial.smoothing = p.bloomRadius;
-    this.chromaticAberration.offset.set(p.chromaticAberration, p.chromaticAberration);
-    this.vignetteEffect.darkness = p.vignetteDarkness;
-    this.noiseEffect.blendMode.opacity.value = p.noiseIntensity;
+    this.pp.applyParams({
+      bloomStrength: p.bloomStrength,
+      bloomThreshold: p.bloomThreshold,
+      bloomSmoothing: p.bloomRadius,
+      chromaticAberration: p.chromaticAberration,
+      vignetteDarkness: p.vignetteDarkness,
+      noiseIntensity: p.noiseIntensity,
+    });
   }
 
   private setupGUI(ctx: SimulationContext) {
-    ctx.gui.add(this.params, 'preset', Object.keys(PRESETS)).name('Preset').onChange((name: string) => {
-      Object.assign(this.params, PRESETS[name]);
-      this.applyParams();
-      ctx.gui.controllersRecursive().forEach(c => c.updateDisplay());
-    });
+    const { l } = ctx;
 
-    const chem = ctx.gui.addFolder('Chemistry');
-    chem.add(this.params, 'feedRate', 0.0, 0.1, 0.0001).name('Feed Rate (f)').onChange((v: number) => {
+    addPresetControl(ctx.gui, this.params, PRESETS, () => this.applyParams(), l);
+
+    const chem = ctx.gui.addFolder(l('Chemistry'));
+    chem.add(this.params, 'feedRate', 0.0, 0.1, 0.0001).name(l('Feed Rate (f)')).onChange((v: number) => {
       this.chemVar.material.uniforms.uFeedRate.value = v;
     });
-    chem.add(this.params, 'killRate', 0.0, 0.1, 0.0001).name('Kill Rate (k)').onChange((v: number) => {
+    chem.add(this.params, 'killRate', 0.0, 0.1, 0.0001).name(l('Kill Rate (k)')).onChange((v: number) => {
       this.chemVar.material.uniforms.uKillRate.value = v;
     });
 
-    const sim = ctx.gui.addFolder('Simulation');
-    sim.add(this.params, 'iterations', 1, 64, 1).name('Steps / Frame');
-    sim.add(this.params, 'timestep', 0.1, 2.0, 0.1).name('Timestep').onChange((v: number) => {
+    const sim = ctx.gui.addFolder(l('Simulation'));
+    sim.add(this.params, 'iterations', 1, 64, 1).name(l('Steps / Frame'));
+    sim.add(this.params, 'timestep', 0.1, 2.0, 0.1).name(l('Timestep')).onChange((v: number) => {
       this.chemVar.material.uniforms.uTimestep.value = v;
     });
-    sim.add(this.params, 'diffusionU', 0.0, 0.5, 0.001).name('Diffusion U').onChange((v: number) => {
+    sim.add(this.params, 'diffusionU', 0.0, 0.5, 0.001).name(l('Diffusion U')).onChange((v: number) => {
       this.chemVar.material.uniforms.uDiffusionU.value = v;
     });
-    sim.add(this.params, 'diffusionV', 0.0, 0.25, 0.001).name('Diffusion V').onChange((v: number) => {
+    sim.add(this.params, 'diffusionV', 0.0, 0.25, 0.001).name(l('Diffusion V')).onChange((v: number) => {
       this.chemVar.material.uniforms.uDiffusionV.value = v;
     });
-    sim.add(this.params, 'brushRadius', 0.005, 0.1, 0.005).name('Brush Radius');
+    sim.add(this.params, 'brushRadius', 0.005, 0.1, 0.005).name(l('Brush Radius'));
 
-    const look = ctx.gui.addFolder('Appearance');
-    look.addColor(this.params, 'color1').name('Background').onChange((v: string) => {
+    const look = ctx.gui.addFolder(l('Appearance'));
+    look.addColor(this.params, 'color1').name(l('Background')).onChange((v: string) => {
       (this.displayMat.uniforms.uColor1.value as THREE.Color).set(v);
     });
-    look.addColor(this.params, 'color2').name('Low V').onChange((v: string) => {
+    look.addColor(this.params, 'color2').name(l('Low V')).onChange((v: string) => {
       (this.displayMat.uniforms.uColor2.value as THREE.Color).set(v);
     });
-    look.addColor(this.params, 'color3').name('Mid V').onChange((v: string) => {
+    look.addColor(this.params, 'color3').name(l('Mid V')).onChange((v: string) => {
       (this.displayMat.uniforms.uColor3.value as THREE.Color).set(v);
     });
-    look.addColor(this.params, 'color4').name('High V').onChange((v: string) => {
+    look.addColor(this.params, 'color4').name(l('High V')).onChange((v: string) => {
       (this.displayMat.uniforms.uColor4.value as THREE.Color).set(v);
     });
-    look.add(this.params, 'brightness', 0.1, 3.0, 0.05).name('Brightness').onChange((v: number) => {
+    look.add(this.params, 'brightness', 0.1, 3.0, 0.05).name(l('Brightness')).onChange((v: number) => {
       this.displayMat.uniforms.uBrightness.value = v;
     });
 
-    const pp = ctx.gui.addFolder('Post Processing');
-    pp.add(this.params, 'bloomStrength', 0, 2, 0.05).name('Bloom Strength').onChange((v: number) => {
-      this.bloomEffect.intensity = v;
+    const pp = ctx.gui.addFolder(l('Post Processing'));
+    pp.add(this.params, 'bloomStrength', 0, 2, 0.05).name(l('Bloom Strength')).onChange((v: number) => {
+      this.pp.bloomEffect.intensity = v;
     });
-    pp.add(this.params, 'bloomRadius', 0, 1, 0.05).name('Bloom Smoothing').onChange((v: number) => {
-      this.bloomEffect.luminanceMaterial.smoothing = v;
+    pp.add(this.params, 'bloomRadius', 0, 1, 0.05).name(l('Bloom Smoothing')).onChange((v: number) => {
+      this.pp.bloomEffect.luminanceMaterial.smoothing = v;
     });
-    pp.add(this.params, 'bloomThreshold', 0, 1, 0.05).name('Bloom Threshold').onChange((v: number) => {
-      this.bloomEffect.luminanceMaterial.threshold = v;
+    pp.add(this.params, 'bloomThreshold', 0, 1, 0.05).name(l('Bloom Threshold')).onChange((v: number) => {
+      this.pp.bloomEffect.luminanceMaterial.threshold = v;
     });
-    pp.add(this.params, 'chromaticAberration', 0, 0.3, 0.005).name('Chromatic Aberration').onChange((v: number) => {
-      this.chromaticAberration.offset.set(v, v);
+    pp.add(this.params, 'chromaticAberration', 0, 0.3, 0.005).name(l('Chromatic Aberration')).onChange((v: number) => {
+      this.pp.chromaticAberration.offset.set(v, v);
     });
-    pp.add(this.params, 'vignetteDarkness', 0, 1, 0.05).name('Vignette').onChange((v: number) => {
-      this.vignetteEffect.darkness = v;
+    pp.add(this.params, 'vignetteDarkness', 0, 1, 0.05).name(l('Vignette')).onChange((v: number) => {
+      this.pp.vignetteEffect.darkness = v;
     });
-    pp.add(this.params, 'noiseIntensity', 0, 0.15, 0.005).name('Film Grain').onChange((v: number) => {
-      this.noiseEffect.blendMode.opacity.value = v;
+    pp.add(this.params, 'noiseIntensity', 0, 0.15, 0.005).name(l('Film Grain')).onChange((v: number) => {
+      this.pp.noiseEffect.blendMode.opacity.value = v;
     });
   }
 }

@@ -2,8 +2,9 @@ import './style.css';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
-import type { Simulation, SimulationContext, SimulationClickEvent } from './simulation';
+import type { Simulation, SimulationContext } from './simulation';
 import { simulations } from './simulations';
+import { configure2DControls, createClickHandler } from './shared/context';
 
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
 const listEl = document.getElementById('simulation-list')!;
@@ -42,6 +43,10 @@ const SIM_HINTS: Record<string, string> = {
     : 'Drag to inject dye  \u00b7  Zoom: scroll  \u00b7  Fullscreen: F',
 };
 
+const HINT_TIMEOUT_MS = 4000;
+const FAVICON_DEBOUNCE_MS = 2000;
+const TRANSITION_MS = 300;
+
 let hintTimeout: ReturnType<typeof setTimeout> | null = null;
 
 function showHints(simName: string) {
@@ -52,7 +57,7 @@ function showHints(simName: string) {
   if (hintTimeout) clearTimeout(hintTimeout);
   hintTimeout = setTimeout(() => {
     hintsEl.classList.remove('visible');
-  }, 4000);
+  }, HINT_TIMEOUT_MS);
 }
 
 // ── Floating panel toggle ──
@@ -87,6 +92,9 @@ controls.enableDamping = true;
 
 let gui = new GUI({ container: guiContainer });
 gui.title('Parameters');
+
+// Standalone page has no translations
+const l = (key: string) => key;
 
 // ── State ──
 
@@ -125,7 +133,7 @@ function scheduleFaviconUpdate() {
       }
       link.href = tmpCanvas.toDataURL('image/png');
     });
-  }, 2000);
+  }, FAVICON_DEBOUNCE_MS);
 }
 
 // ── Load Simulation ──
@@ -141,7 +149,7 @@ async function loadSimulation(sim: Simulation, skipTransition = false) {
   if (!skipTransition && activeSim) {
     isTransitioning = true;
     transitionOverlay.classList.add('active');
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, TRANSITION_MS));
   }
 
   // Tear down previous
@@ -159,13 +167,10 @@ async function loadSimulation(sim: Simulation, skipTransition = false) {
   controls.enableDamping = true;
 
   if (sim.is2D) {
-    controls.enableRotate = false;
-    controls.screenSpacePanning = true;
-    controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
-    controls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_PAN };
+    configure2DControls(controls);
   }
 
-  const ctx: SimulationContext = { scene, camera, renderer, controls, gui };
+  const ctx: SimulationContext = { scene, camera, renderer, controls, gui, l };
   sim.setup(ctx);
   activeSim = sim;
 
@@ -182,7 +187,7 @@ async function loadSimulation(sim: Simulation, skipTransition = false) {
 
   if (!skipTransition && isTransitioning) {
     transitionOverlay.classList.remove('active');
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, TRANSITION_MS));
     isTransitioning = false;
   }
 }
@@ -199,18 +204,8 @@ simulations.forEach((sim) => {
 
 // ── Click Handling ──
 
-const raycaster = new THREE.Raycaster();
-canvas.addEventListener('pointerdown', (e) => {
-  if (!activeSim?.onClick) return;
-  const rect = canvas.getBoundingClientRect();
-  const ndc = new THREE.Vector2(
-    ((e.clientX - rect.left) / rect.width) * 2 - 1,
-    -((e.clientY - rect.top) / rect.height) * 2 + 1,
-  );
-  raycaster.setFromCamera(ndc, camera);
-  const event: SimulationClickEvent = { ndc, pointer: e, raycaster };
-  activeSim.onClick(event);
-});
+const onPointerDown = createClickHandler(canvas, () => camera, () => activeSim);
+canvas.addEventListener('pointerdown', onPointerDown);
 
 // ── Resize ──
 

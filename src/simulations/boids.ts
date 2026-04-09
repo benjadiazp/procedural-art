@@ -1,231 +1,25 @@
 import * as THREE from 'three';
 import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
-import {
-  EffectComposer, EffectPass, RenderPass,
-  BloomEffect, ChromaticAberrationEffect, VignetteEffect, NoiseEffect,
-  BlendFunction, Pass,
-} from 'postprocessing';
+import { Pass } from 'postprocessing';
 import type { Simulation, SimulationContext } from '../simulation';
+import type { GPUVariable } from '../shared/types';
+import { addPresetControl } from '../shared/preset';
+import { createPostProcessing, type PostProcessingResult } from '../shared/post-processing';
+import { injectDefines } from '../shared/glsl-utils';
+import velocityShaderRaw from './shaders/boids/velocity.frag.glsl?raw';
+import positionShader from './shaders/boids/position.frag.glsl?raw';
+import pointVert from './shaders/boids/point.vert.glsl?raw';
+import pointFrag from './shaders/boids/point.frag.glsl?raw';
+import afterimageVS from './shaders/boids/afterimage.vert.glsl?raw';
 
 // Texture dimensions — total capacity = TEX_WIDTH * TEX_HEIGHT
 const TEX_WIDTH = 1024;
 const TEX_HEIGHT = 512;
 const MAX_BOIDS = TEX_WIDTH * TEX_HEIGHT; // 524 288
 const MAX_PREDATORS = 8;
+const OFFSCREEN_POS = 99999;
 
-// ────────────────────────────── GLSL ──────────────────────────────
-
-const velocityShader = /* glsl */ `
-uniform float uDelta;
-uniform float uTime;
-uniform float uActiveCount;
-uniform float uSeparationWeight;
-uniform float uAlignmentWeight;
-uniform float uCohesionWeight;
-uniform float uMaxSpeed;
-uniform float uPerceptionRadius;
-uniform float uSeparationRadius;
-uniform float uBoundarySize;
-uniform int uPredatorCount;
-uniform vec3 uPredators[${MAX_PREDATORS}];
-uniform float uFleeRadius;
-
-vec2 hash2(vec2 p) {
-  p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-  return fract(sin(p) * 43758.5453);
-}
-
-void main() {
-  vec2 uv = gl_FragCoord.xy / resolution.xy;
-  float index = gl_FragCoord.y * resolution.x + gl_FragCoord.x;
-
-  if (index >= uActiveCount) {
-    gl_FragColor = texture2D(textureVelocity, uv);
-    return;
-  }
-
-  vec3 pos = texture2D(texturePosition, uv).xyz;
-  vec3 vel = texture2D(textureVelocity, uv).xyz;
-
-  vec3 separation = vec3(0.0);
-  vec3 alignment  = vec3(0.0);
-  vec3 cohesion   = vec3(0.0);
-  float sepW  = 0.0;
-  float aliW  = 0.0;
-  float cohW  = 0.0;
-
-  // Scale factors for Cauchy-Lorentz weighting (no hard cutoffs)
-  float percSq = uPerceptionRadius * uPerceptionRadius;
-  float sepSq  = uSeparationRadius * uSeparationRadius;
-  float maxForce = uMaxSpeed * 0.5;
-
-  // Stochastic sampling — every sample contributes via distance weighting
-  for (int i = 0; i < 32; i++) {
-    float fi = float(i);
-    vec2 seed = uv * 1000.0 + vec2(fi * 1.13, fract(uTime * 0.1) * 100.0 + fi * 0.37);
-    vec2 r = hash2(seed);
-    float idx = floor(r.x * uActiveCount);
-    vec2 sampleUV = (vec2(mod(idx, resolution.x), floor(idx / resolution.x)) + 0.5) / resolution.xy;
-
-    vec3 oPos = texture2D(texturePosition, sampleUV).xyz;
-    vec3 oVel = texture2D(textureVelocity, sampleUV).xyz;
-
-    vec3 diff = pos - oPos;
-    float dSq = dot(diff, diff);
-    if (dSq < 0.0001) continue;  // skip self
-
-    // Cauchy weight: 1 at d=0, 0.5 at d=percRad, smooth fall-off — never 0
-    float wPerc = percSq / (percSq + dSq);
-    alignment += oVel * wPerc;   aliW += wPerc;
-    cohesion  += oPos * wPerc;   cohW += wPerc;
-
-    // Separation: sharper weight, repel inversely by distance
-    float wSep = sepSq / (sepSq + dSq);
-    float d = sqrt(dSq);
-    separation += (diff / d) * wSep / d;
-    sepW += wSep;
-  }
-
-  vec3 accel = vec3(0.0);
-
-  if (sepW > 0.0001) {
-    separation /= sepW;
-    float sl = length(separation);
-    if (sl > 0.0001) {
-      separation = separation / sl * uMaxSpeed - vel;
-      sl = length(separation);
-      if (sl > maxForce) separation *= maxForce / sl;
-      accel += separation * uSeparationWeight;
-    }
-  }
-  if (aliW > 0.0001) {
-    alignment /= aliW;
-    float al = length(alignment);
-    if (al > 0.0001) {
-      alignment = alignment / al * uMaxSpeed - vel;
-      al = length(alignment);
-      if (al > maxForce) alignment *= maxForce / al;
-      accel += alignment * uAlignmentWeight;
-    }
-  }
-  if (cohW > 0.0001) {
-    cohesion /= cohW;
-    vec3 steer = cohesion - pos;
-    float cl = length(steer);
-    if (cl > 0.0001) {
-      steer = steer / cl * uMaxSpeed - vel;
-      cl = length(steer);
-      if (cl > maxForce) steer *= maxForce / cl;
-      accel += steer * uCohesionWeight;
-    }
-  }
-
-  // Flee from predators (Cauchy-weighted, no hard cutoff)
-  float fleeSq = uFleeRadius * uFleeRadius;
-  for (int i = 0; i < ${MAX_PREDATORS}; i++) {
-    if (i >= uPredatorCount) break;
-    vec3 dd = pos - uPredators[i];
-    float dSq = dot(dd, dd);
-    if (dSq > 0.0001) {
-      float wFlee = fleeSq / (fleeSq + dSq);
-      vec3 flee = normalize(dd) * uMaxSpeed - vel;
-      float fl = length(flee);
-      if (fl > maxForce * 2.0) flee *= maxForce * 2.0 / fl;
-      accel += flee * wFlee * 4.0;
-    }
-  }
-
-  // Soft boundary steering
-  float threshold = uBoundarySize * 0.8;
-  float edge = uBoundarySize - threshold;
-  for (int a = 0; a < 3; a++) {
-    float p = a == 0 ? pos.x : (a == 1 ? pos.y : pos.z);
-    float ap = abs(p);
-    if (ap > threshold) {
-      float o = (ap - threshold) / edge;
-      float f = -sign(p) * o * o * uMaxSpeed;
-      if (a == 0) accel.x += f;
-      else if (a == 1) accel.y += f;
-      else accel.z += f;
-    }
-  }
-
-  vel += accel * uDelta;
-  float speed = length(vel);
-  if (speed > uMaxSpeed) vel *= uMaxSpeed / speed;
-  if (speed < uMaxSpeed * 0.05) vel += vec3(0.001, 0.0, 0.0);
-
-  gl_FragColor = vec4(vel, 1.0);
-}
-`;
-
-const positionShader = /* glsl */ `
-uniform float uDelta;
-uniform float uActiveCount;
-
-void main() {
-  vec2 uv = gl_FragCoord.xy / resolution.xy;
-  float index = gl_FragCoord.y * resolution.x + gl_FragCoord.x;
-  vec3 pos = texture2D(texturePosition, uv).xyz;
-
-  if (index >= uActiveCount) {
-    gl_FragColor = vec4(pos, 1.0);
-    return;
-  }
-
-  vec3 vel = texture2D(textureVelocity, uv).xyz;
-  gl_FragColor = vec4(pos + vel * uDelta, 1.0);
-}
-`;
-
-const pointVert = /* glsl */ `
-uniform sampler2D tPosition;
-uniform sampler2D tVelocity;
-uniform float uPointSize;
-uniform float uMaxSpeed;
-uniform float uActiveCount;
-uniform vec2 uTexRes;
-
-attribute vec2 reference;
-
-varying float vSpeed;
-varying float vActive;
-
-void main() {
-  float idx = reference.y * uTexRes.x + reference.x;
-  vActive = step(idx, uActiveCount - 1.0);
-
-  vec2 uv = (reference + 0.5) / uTexRes;
-  vec3 pos = texture2D(tPosition, uv).xyz;
-  vec3 vel = texture2D(tVelocity, uv).xyz;
-  vSpeed = clamp(length(vel) / uMaxSpeed, 0.0, 1.0);
-
-  vec4 mv = modelViewMatrix * vec4(pos, 1.0);
-  gl_PointSize = uPointSize * (300.0 / max(-mv.z, 1.0)) * vActive;
-  gl_Position  = projectionMatrix * mv;
-}
-`;
-
-const pointFrag = /* glsl */ `
-uniform vec3 uColorSlow;
-uniform vec3 uColorFast;
-uniform float uBrightness;
-
-varying float vSpeed;
-varying float vActive;
-
-void main() {
-  if (vActive < 0.5) discard;
-  float d = length(gl_PointCoord - vec2(0.5));
-  if (d > 0.5) discard;
-
-  float alpha = 1.0 - smoothstep(0.1, 0.5, d);
-  vec3 col = mix(uColorSlow, uColorFast, vSpeed) * uBrightness;
-  col += exp(-d * 8.0) * uBrightness * 0.3;  // subtle hot center for bloom
-
-  gl_FragColor = vec4(col, alpha);
-}
-`;
+const velocityShader = injectDefines(velocityShaderRaw, { MAX_PREDATORS });
 
 // ────────────────────────────── Presets ──────────────────────────────
 
@@ -306,8 +100,6 @@ const PRESETS: Record<string, PresetValues> = {
 };
 
 // ────────────────────────────── Afterimage Pass ──────────────────────────────
-
-const afterimageVS = /* glsl */ `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position, 1.0); }`;
 
 class AfterimagePass extends Pass {
   private feedbackTarget: THREE.WebGLRenderTarget;
@@ -401,8 +193,8 @@ export class BoidsSimulation implements Simulation {
 
   // GPU compute
   private gpuCompute!: GPUComputationRenderer;
-  private posVar: any;
-  private velVar: any;
+  private posVar!: GPUVariable;
+  private velVar!: GPUVariable;
 
   // Rendering
   private points!: THREE.Points;
@@ -417,12 +209,8 @@ export class BoidsSimulation implements Simulation {
   private predMat!: THREE.MeshBasicMaterial;
 
   // Post-processing
-  private composer!: EffectComposer;
-  private bloomEffect!: BloomEffect;
+  private pp!: PostProcessingResult;
   private afterimagePass!: AfterimagePass;
-  private chromaticAberration!: ChromaticAberrationEffect;
-  private vignetteEffect!: VignetteEffect;
-  private noiseEffect!: NoiseEffect;
 
   private ctx!: SimulationContext;
 
@@ -494,11 +282,11 @@ export class BoidsSimulation implements Simulation {
   }
 
   render() {
-    this.composer.render();
+    this.pp.composer.render();
   }
 
   onResize(w: number, h: number) {
-    this.composer.setSize(w, h);
+    this.pp.composer.setSize(w, h);
     this.afterimagePass.setSize(w, h);
   }
 
@@ -518,7 +306,7 @@ export class BoidsSimulation implements Simulation {
     this.ptMat.dispose();
     this.predGeom.dispose();
     this.predMat.dispose();
-    this.composer.dispose();
+    this.pp.composer.dispose();
   }
 
   /* ─── init helpers ─── */
@@ -530,7 +318,7 @@ export class BoidsSimulation implements Simulation {
     scene.add(this.predGroup);
 
     for (let i = 0; i < MAX_PREDATORS; i++) {
-      this.predPos.push(new THREE.Vector3(99999, 99999, 99999));
+      this.predPos.push(new THREE.Vector3(OFFSCREEN_POS, OFFSCREEN_POS, OFFSCREEN_POS));
       const m = new THREE.Mesh(this.predGeom, this.predMat);
       m.visible = false;
       this.predMeshes.push(m);
@@ -643,48 +431,22 @@ export class BoidsSimulation implements Simulation {
     const w = ctx.renderer.domElement.clientWidth;
     const h = ctx.renderer.domElement.clientHeight;
 
-    this.composer = new EffectComposer(ctx.renderer, {
-      frameBufferType: THREE.HalfFloatType,
+    this.pp = createPostProcessing(ctx.renderer, ctx.scene, ctx.camera, {
+      bloomStrength: this.params.bloomStrength,
+      bloomThreshold: this.params.bloomThreshold,
+      bloomSmoothing: this.params.bloomRadius,
+      chromaticAberration: this.params.chromaticAberration,
+      vignetteDarkness: this.params.vignetteDarkness,
+      noiseIntensity: this.params.noiseIntensity,
+    }, {
+      separateBloom: true,
+      chromaModulationOffset: 0.2,
+      vignetteOffset: 0.35,
+      afterBloom: (composer) => {
+        this.afterimagePass = new AfterimagePass(this.params.afterimage, w, h);
+        composer.addPass(this.afterimagePass);
+      },
     });
-
-    this.composer.addPass(new RenderPass(ctx.scene, ctx.camera));
-
-    // Bloom → separate EffectPass so afterimage sits between bloom and final effects
-    this.bloomEffect = new BloomEffect({
-      intensity: this.params.bloomStrength,
-      luminanceThreshold: this.params.bloomThreshold,
-      luminanceSmoothing: this.params.bloomRadius,
-      mipmapBlur: true,
-    });
-    this.composer.addPass(new EffectPass(ctx.camera, this.bloomEffect));
-
-    // Afterimage (trail accumulation) — custom pass between bloom and final FX
-    this.afterimagePass = new AfterimagePass(this.params.afterimage, w, h);
-    this.composer.addPass(this.afterimagePass);
-
-    // Final effects: chromatic aberration, vignette, noise
-    this.chromaticAberration = new ChromaticAberrationEffect({
-      offset: new THREE.Vector2(this.params.chromaticAberration, this.params.chromaticAberration),
-      radialModulation: true,
-      modulationOffset: 0.2,
-    });
-
-    this.vignetteEffect = new VignetteEffect({
-      darkness: this.params.vignetteDarkness,
-      offset: 0.35,
-    });
-
-    this.noiseEffect = new NoiseEffect({
-      blendFunction: BlendFunction.OVERLAY,
-    });
-    this.noiseEffect.blendMode.opacity.value = this.params.noiseIntensity;
-
-    this.composer.addPass(new EffectPass(
-      ctx.camera,
-      this.chromaticAberration,
-      this.vignetteEffect,
-      this.noiseEffect,
-    ));
   }
 
   /* ─── predator motion ─── */
@@ -707,7 +469,7 @@ export class BoidsSimulation implements Simulation {
         this.predMeshes[i].visible = true;
       } else {
         this.predMeshes[i].visible = false;
-        this.predPos[i].set(99999, 99999, 99999);
+        this.predPos[i].set(OFFSCREEN_POS, OFFSCREEN_POS, OFFSCREEN_POS);
       }
     }
   }
@@ -748,91 +510,90 @@ export class BoidsSimulation implements Simulation {
     this.predMat.color.set(p.predatorColor);
 
     // Post-processing
-    this.bloomEffect.intensity = p.bloomStrength;
-    this.bloomEffect.luminanceMaterial.threshold = p.bloomThreshold;
-    this.bloomEffect.luminanceMaterial.smoothing = p.bloomRadius;
+    this.pp.applyParams({
+      bloomStrength: p.bloomStrength,
+      bloomThreshold: p.bloomThreshold,
+      bloomSmoothing: p.bloomRadius,
+      chromaticAberration: p.chromaticAberration,
+      vignetteDarkness: p.vignetteDarkness,
+      noiseIntensity: p.noiseIntensity,
+    });
     this.afterimagePass.damp = p.afterimage;
-    this.chromaticAberration.offset.set(p.chromaticAberration, p.chromaticAberration);
-    this.vignetteEffect.darkness = p.vignetteDarkness;
-    this.noiseEffect.blendMode.opacity.value = p.noiseIntensity;
   }
 
   private setupGUI(ctx: SimulationContext) {
+    const { l } = ctx;
     const setVU = (name: string, v: number) => {
       this.velVar.material.uniforms[name].value = v;
     };
 
-    ctx.gui.add(this.params, 'preset', Object.keys(PRESETS)).name('Preset').onChange((name: string) => {
-      Object.assign(this.params, PRESETS[name]);
-      this.applyParams();
-      ctx.gui.controllersRecursive().forEach(c => c.updateDisplay());
-    });
+    addPresetControl(ctx.gui, this.params, PRESETS, () => this.applyParams(), l);
 
-    const flock = ctx.gui.addFolder('Flock');
-    flock.add(this.params, 'count', 1000, MAX_BOIDS, 1000).name('Count').onChange((v: number) => {
+    const flock = ctx.gui.addFolder(l('Flock'));
+    flock.add(this.params, 'count', 1000, MAX_BOIDS, 1000).name(l('Count')).onChange((v: number) => {
       this.posVar.material.uniforms.uActiveCount.value = v;
       setVU('uActiveCount', v);
       this.ptMat.uniforms.uActiveCount.value = v;
       this.ptGeo.setDrawRange(0, v);
     });
-    flock.add(this.params, 'predatorCount', 0, MAX_PREDATORS, 1).name('Predators').onChange((v: number) => {
+    flock.add(this.params, 'predatorCount', 0, MAX_PREDATORS, 1).name(l('Predators')).onChange((v: number) => {
       setVU('uPredatorCount', v);
     });
 
-    const behavior = ctx.gui.addFolder('Behavior');
-    behavior.add(this.params, 'separationWeight', 0, 5, 0.1).name('Separation').onChange((v: number) => setVU('uSeparationWeight', v));
-    behavior.add(this.params, 'alignmentWeight', 0, 5, 0.1).name('Alignment').onChange((v: number) => setVU('uAlignmentWeight', v));
-    behavior.add(this.params, 'cohesionWeight', 0, 5, 0.1).name('Cohesion').onChange((v: number) => setVU('uCohesionWeight', v));
-    behavior.add(this.params, 'speed', 1, 25, 0.5).name('Speed').onChange((v: number) => {
+    const behavior = ctx.gui.addFolder(l('Behavior'));
+    behavior.add(this.params, 'separationWeight', 0, 5, 0.1).name(l('Separation')).onChange((v: number) => setVU('uSeparationWeight', v));
+    behavior.add(this.params, 'alignmentWeight', 0, 5, 0.1).name(l('Alignment')).onChange((v: number) => setVU('uAlignmentWeight', v));
+    behavior.add(this.params, 'cohesionWeight', 0, 5, 0.1).name(l('Cohesion')).onChange((v: number) => setVU('uCohesionWeight', v));
+    behavior.add(this.params, 'speed', 1, 25, 0.5).name(l('Speed')).onChange((v: number) => {
       setVU('uMaxSpeed', v);
       this.ptMat.uniforms.uMaxSpeed.value = v;
     });
-    behavior.add(this.params, 'predatorSpeed', 0.1, 2, 0.05).name('Predator Speed');
-    behavior.add(this.params, 'perceptionRadius', 1, 15, 0.5).name('Perception').onChange((v: number) => setVU('uPerceptionRadius', v));
-    behavior.add(this.params, 'separationRadius', 0.5, 5, 0.1).name('Sep. Radius').onChange((v: number) => setVU('uSeparationRadius', v));
-    behavior.add(this.params, 'fleeRadius', 2, 30, 1).name('Flee Radius').onChange((v: number) => setVU('uFleeRadius', v));
+    behavior.add(this.params, 'predatorSpeed', 0.1, 2, 0.05).name(l('Predator Speed'));
+    behavior.add(this.params, 'perceptionRadius', 1, 15, 0.5).name(l('Perception')).onChange((v: number) => setVU('uPerceptionRadius', v));
+    behavior.add(this.params, 'separationRadius', 0.5, 5, 0.1).name(l('Sep. Radius')).onChange((v: number) => setVU('uSeparationRadius', v));
+    behavior.add(this.params, 'fleeRadius', 2, 30, 1).name(l('Flee Radius')).onChange((v: number) => setVU('uFleeRadius', v));
 
-    const world = ctx.gui.addFolder('World');
-    world.add(this.params, 'boundarySize', 10, 400, 5).name('Boundary').onChange((v: number) => setVU('uBoundarySize', v));
+    const world = ctx.gui.addFolder(l('World'));
+    world.add(this.params, 'boundarySize', 10, 400, 5).name(l('Boundary')).onChange((v: number) => setVU('uBoundarySize', v));
 
-    const look = ctx.gui.addFolder('Appearance');
-    look.add(this.params, 'pointSize', 0.5, 5, 0.1).name('Point Size').onChange((v: number) => {
+    const look = ctx.gui.addFolder(l('Appearance'));
+    look.add(this.params, 'pointSize', 0.5, 5, 0.1).name(l('Point Size')).onChange((v: number) => {
       this.ptMat.uniforms.uPointSize.value = v;
     });
-    look.add(this.params, 'brightness', 0.02, 0.5, 0.01).name('Brightness').onChange((v: number) => {
+    look.add(this.params, 'brightness', 0.02, 0.5, 0.01).name(l('Brightness')).onChange((v: number) => {
       this.ptMat.uniforms.uBrightness.value = v;
     });
-    look.addColor(this.params, 'colorSlow').name('Slow Color').onChange((v: string) => {
+    look.addColor(this.params, 'colorSlow').name(l('Slow Color')).onChange((v: string) => {
       (this.ptMat.uniforms.uColorSlow.value as THREE.Color).set(v);
     });
-    look.addColor(this.params, 'colorFast').name('Fast Color').onChange((v: string) => {
+    look.addColor(this.params, 'colorFast').name(l('Fast Color')).onChange((v: string) => {
       (this.ptMat.uniforms.uColorFast.value as THREE.Color).set(v);
     });
-    look.addColor(this.params, 'predatorColor').name('Predator Color').onChange((v: string) => {
+    look.addColor(this.params, 'predatorColor').name(l('Predator Color')).onChange((v: string) => {
       this.predMat.color.set(v);
     });
 
-    const pp = ctx.gui.addFolder('Post Processing');
-    pp.add(this.params, 'bloomStrength', 0, 3, 0.05).name('Bloom Strength').onChange((v: number) => {
-      this.bloomEffect.intensity = v;
+    const pp = ctx.gui.addFolder(l('Post Processing'));
+    pp.add(this.params, 'bloomStrength', 0, 3, 0.05).name(l('Bloom Strength')).onChange((v: number) => {
+      this.pp.bloomEffect.intensity = v;
     });
-    pp.add(this.params, 'bloomRadius', 0, 1, 0.05).name('Bloom Smoothing').onChange((v: number) => {
-      this.bloomEffect.luminanceMaterial.smoothing = v;
+    pp.add(this.params, 'bloomRadius', 0, 1, 0.05).name(l('Bloom Smoothing')).onChange((v: number) => {
+      this.pp.bloomEffect.luminanceMaterial.smoothing = v;
     });
-    pp.add(this.params, 'bloomThreshold', 0, 1, 0.05).name('Bloom Threshold').onChange((v: number) => {
-      this.bloomEffect.luminanceMaterial.threshold = v;
+    pp.add(this.params, 'bloomThreshold', 0, 1, 0.05).name(l('Bloom Threshold')).onChange((v: number) => {
+      this.pp.bloomEffect.luminanceMaterial.threshold = v;
     });
-    pp.add(this.params, 'afterimage', 0, 0.99, 0.01).name('Afterimage').onChange((v: number) => {
+    pp.add(this.params, 'afterimage', 0, 0.99, 0.01).name(l('Afterimage')).onChange((v: number) => {
       this.afterimagePass.damp = v;
     });
-    pp.add(this.params, 'chromaticAberration', 0, 0.3, 0.005).name('Chromatic Aberration').onChange((v: number) => {
-      this.chromaticAberration.offset.set(v, v);
+    pp.add(this.params, 'chromaticAberration', 0, 0.3, 0.005).name(l('Chromatic Aberration')).onChange((v: number) => {
+      this.pp.chromaticAberration.offset.set(v, v);
     });
-    pp.add(this.params, 'vignetteDarkness', 0, 1, 0.05).name('Vignette').onChange((v: number) => {
-      this.vignetteEffect.darkness = v;
+    pp.add(this.params, 'vignetteDarkness', 0, 1, 0.05).name(l('Vignette')).onChange((v: number) => {
+      this.pp.vignetteEffect.darkness = v;
     });
-    pp.add(this.params, 'noiseIntensity', 0, 0.2, 0.005).name('Film Grain').onChange((v: number) => {
-      this.noiseEffect.blendMode.opacity.value = v;
+    pp.add(this.params, 'noiseIntensity', 0, 0.2, 0.005).name(l('Film Grain')).onChange((v: number) => {
+      this.pp.noiseEffect.blendMode.opacity.value = v;
     });
   }
 }
